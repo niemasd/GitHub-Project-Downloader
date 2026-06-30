@@ -200,6 +200,7 @@ query($projectId: ID!, $cursor: String, $columnFieldName: String!) {
               id
               number
               title
+              body
               url
               state
               createdAt
@@ -221,6 +222,7 @@ query($projectId: ID!, $cursor: String, $columnFieldName: String!) {
               id
               number
               title
+              body
               url
               state
               createdAt
@@ -657,6 +659,16 @@ def iter_issue_comments(
     yield from client.rest_get_paginated(path, params={"per_page": 100})
 
 
+def original_post_as_comment(issue: dict[str, Any]) -> dict[str, Any]:
+    """Return the Issue/PR opening body in the same shape as a REST issue comment."""
+    author = issue.get("author") or {}
+    return {
+        "user": {"login": author.get("login") or "unknown"},
+        "created_at": issue.get("createdAt"),
+        "body": issue.get("body") or "",
+    }
+
+
 def parse_github_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
@@ -745,6 +757,13 @@ def build_markdown(
                 lines.append("")
                 continue
 
+            original_post = original_post_as_comment(issue)
+            comment_count += 1
+            lines.append(comment_heading(original_post, tz))
+            lines.append("")
+            lines.append(original_post.get("body") or "")
+            lines.append("")
+
             for comment in iter_issue_comments(client, str(repo_owner), str(repo_name), int(issue_number)):
                 comment_count += 1
                 lines.append(comment_heading(comment, tz))
@@ -757,23 +776,32 @@ def build_markdown(
 
 
 def export_project(project_url: str, output_path: Path, tz_name: str = DEFAULT_TZ) -> dict[str, int | str]:
+    print(f"Exporting project: {project_url}", file=sys.stderr)
     parsed_project_url = parse_project_url(project_url)
+    print("Getting GitHub token...", file=sys.stderr)
     token = get_github_token(parsed_project_url)
 
+    print("Getting timezone...", file=sys.stderr)
     try:
         tz = ZoneInfo(tz_name)
     except ZoneInfoNotFoundError as exc:
         raise GitHubAPIError(f"unknown timezone: {tz_name}") from exc
 
+    print("Initializing client...", file=sys.stderr)
     client = GitHubClient(token)
 
+    print("Loading initial project data...", file=sys.stderr)
     project = get_project(client, parsed_project_url)
     view = choose_board_view(project, parsed_project_url.view_number)
     column_field_name = infer_column_field_name(project, view)
 
+    print("Grouping project items...", file=sys.stderr)
     grouped, stats = group_project_items(client, project, column_field_name)
+
+    print("Building Markdown...", file=sys.stderr)
     markdown, comment_count = build_markdown(client, grouped, tz)
 
+    print(f"Writing Markdown to file: {markdown}", file=sys.stderr)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown, encoding="utf-8")
 
