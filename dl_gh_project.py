@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-dl_gh_project_v2.py
-
 Export the issue-comment history of a GitHub Projects v2 board to Markdown.
 
 Usage:
-    ./dl_gh_project_v2.py --project PROJECT_URL --output OUTPUT.md
-    ./dl_gh_project_v2.py -p PROJECT_URL -o OUTPUT.md
+    ./dl_gh_project.py --project PROJECT_URL --output OUTPUT.md
+    ./dl_gh_project.py -p PROJECT_URL -o OUTPUT.md
 
 Authentication:
     Set GITHUB_TOKEN or GH_TOKEN in the environment. If neither is set, the
