@@ -19,6 +19,7 @@ Notes:
         https://github.com/users/OWNER/projects/NUMBER
         https://github.com/orgs/OWNER/projects/NUMBER/views/VIEW_NUMBER
     - It exports issue opening posts, issue comments, and issue / pull-request timeline events.
+    - It also exports issue sub-issues as peer Markdown sections after their parent issue.
     - It does not export pull-request review comments or draft-project-item text.
 """
 
@@ -45,10 +46,11 @@ API_VERSION = "2026-03-10"
 GRAPHQL_URL = "https://api.github.com/graphql"
 REST_BASE_URL = "https://api.github.com"
 DEFAULT_TZ = "UTC"
-USER_AGENT = "dl-gh-project/1.3"
+USER_AGENT = "dl-gh-project/1.4"
 ARCHIVED_COLUMN_NAME = "Archived"
 ARCHIVED_SECTION_KEY = "__dl_gh_project_archived_items__"
 ARCHIVED_FROM_COLUMN_KEY = "_dl_gh_project_archived_from_column"
+SUB_ISSUE_PARENT_TITLE_KEY = "_dl_gh_project_sub_issue_parent_title"
 
 
 class GitHubAPIError(RuntimeError):
@@ -836,6 +838,116 @@ def iter_issue_timeline_events(
     yield from client.rest_get_paginated(path, params={"per_page": 100})
 
 
+def iter_sub_issues(
+    client: GitHubClient,
+    owner: str,
+    repo: str,
+    issue_number: int,
+) -> Iterator[dict[str, Any]]:
+    """Yield REST issue objects for the direct sub-issues of an issue."""
+    owner_q = quote(owner, safe="")
+    repo_q = quote(repo, safe="")
+    path = f"/repos/{owner_q}/{repo_q}/issues/{issue_number}/sub_issues"
+    yield from client.rest_get_paginated(path, params={"per_page": 100})
+
+
+def repository_from_rest_issue(
+    issue: dict[str, Any],
+    fallback_owner: str,
+    fallback_repo: str,
+) -> tuple[str, str]:
+    """Return the repository owner/name for a REST issue response."""
+    repository = issue.get("repository")
+    if isinstance(repository, dict):
+        owner_obj = repository.get("owner")
+        owner = login_from_obj(owner_obj) if isinstance(owner_obj, dict) else None
+        name = repository.get("name")
+        if owner and name:
+            return str(owner), str(name)
+
+        name_with_owner = repository.get("full_name") or repository.get("nameWithOwner")
+        if isinstance(name_with_owner, str) and "/" in name_with_owner:
+            owner, name = name_with_owner.split("/", 1)
+            if owner and name:
+                return owner, name
+
+    repository_url = issue.get("repository_url")
+    if repository_url:
+        parsed = urlparse(str(repository_url))
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 3 and parts[0] == "repos":
+            return parts[1], parts[2]
+
+    return fallback_owner, fallback_repo
+
+
+def rest_issue_to_project_content(
+    issue: dict[str, Any],
+    fallback_owner: str,
+    fallback_repo: str,
+) -> dict[str, Any]:
+    """Convert a REST issue response to the GraphQL-like content shape used by this script."""
+    repo_owner, repo_name = repository_from_rest_issue(issue, fallback_owner, fallback_repo)
+    author_login = login_from_obj(issue.get("user")) or login_from_obj(issue.get("author"))
+    node_id = issue.get("node_id")
+    if not node_id and isinstance(issue.get("id"), str):
+        node_id = issue.get("id")
+    content: dict[str, Any] = {
+        "__typename": "PullRequest" if issue.get("pull_request") else "Issue",
+        "number": issue.get("number"),
+        "title": issue.get("title"),
+        "body": issue.get("body") or "",
+        "url": issue.get("html_url") or issue.get("url"),
+        "state": issue.get("state"),
+        "createdAt": issue.get("created_at") or issue.get("createdAt"),
+        "updatedAt": issue.get("updated_at") or issue.get("updatedAt"),
+        "closedAt": issue.get("closed_at") or issue.get("closedAt"),
+        "author": {"login": author_login or "unknown"},
+        "repository": {
+            "name": repo_name,
+            "nameWithOwner": f"{repo_owner}/{repo_name}",
+            "owner": {"login": repo_owner},
+        },
+    }
+    if node_id:
+        content["id"] = node_id
+    return content
+
+
+def issue_key(issue: dict[str, Any]) -> tuple[str, str, int] | None:
+    """Return a stable owner/repository/issue-number identity for a GraphQL-like issue."""
+    repository = issue.get("repository") or {}
+    owner_obj = repository.get("owner") if isinstance(repository, dict) else None
+    repo_owner = login_from_obj(owner_obj) if isinstance(owner_obj, dict) else None
+    repo_name = repository.get("name") if isinstance(repository, dict) else None
+    issue_number = issue.get("number")
+
+    if (not repo_owner or not repo_name or not issue_number) and issue.get("url"):
+        parsed = urlparse(str(issue.get("url")))
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 4 and parts[2] in {"issues", "pull"}:
+            repo_owner = repo_owner or parts[0]
+            repo_name = repo_name or parts[1]
+            issue_number = issue_number or parts[3]
+
+    if not repo_owner or not repo_name or not issue_number:
+        return None
+
+    try:
+        number = int(issue_number)
+    except (TypeError, ValueError):
+        return None
+
+    return repo_owner.lower(), repo_name.lower(), number
+
+
+def issue_key_for_item(item: dict[str, Any]) -> tuple[str, str, int] | None:
+    content = item.get("content")
+    if not isinstance(content, dict):
+        return None
+    return issue_key(content)
+
+
 def original_post_as_entry(issue: dict[str, Any]) -> dict[str, Any]:
     """Return the Issue/PR opening body in the same shape as a Markdown timeline entry."""
     author = issue.get("author") or {}
@@ -1174,7 +1286,7 @@ def collect_issue_timeline_entries(
             add_entry(rest_timeline_event_as_entry(event, tz))
 
     content_id = issue.get("id")
-    if content_id:
+    if isinstance(content_id, str) and content_id:
         for event in iter_project_v2_timeline_events(client, str(content_id)):
             add_entry(project_v2_event_as_entry(event, tz))
 
@@ -1202,9 +1314,162 @@ def markdown_section_heading(column_key: str) -> str:
 def archived_issue_heading(issue: dict[str, Any], item: dict[str, Any]) -> str:
     archived_from = item.get(ARCHIVED_FROM_COLUMN_KEY) or "unknown column"
     return (
-        f"{heading_text(issue.get('title'))} "
+        f"{issue_base_heading(issue, item)} "
         f'(archived from "{heading_text(archived_from)}")'
     )
+
+
+def issue_base_heading(issue: dict[str, Any], item: dict[str, Any]) -> str:
+    title = heading_text(issue.get("title"))
+    parent_title = item.get(SUB_ISSUE_PARENT_TITLE_KEY)
+    if parent_title:
+        title = f'{title} (sub-issue of "{heading_text(parent_title)}")'
+    return title
+
+
+def issue_heading(issue: dict[str, Any], item: dict[str, Any], column: str) -> str:
+    if column == ARCHIVED_SECTION_KEY:
+        return archived_issue_heading(issue, item)
+    return issue_base_heading(issue, item)
+
+
+def issue_repository_details(issue: dict[str, Any]) -> tuple[str, str, int] | None:
+    repository = issue.get("repository") or {}
+    if not isinstance(repository, dict):
+        return None
+
+    owner_obj = repository.get("owner") or {}
+    repo_owner = login_from_obj(owner_obj)
+    repo_name = repository.get("name")
+    issue_number = issue.get("number")
+
+    if not repo_owner or not repo_name or issue_number is None:
+        return None
+
+    try:
+        number = int(issue_number)
+    except (TypeError, ValueError):
+        return None
+
+    return str(repo_owner), str(repo_name), number
+
+
+def issue_can_have_sub_issues(issue: dict[str, Any]) -> bool:
+    return issue.get("__typename") == "Issue" and issue_repository_details(issue) is not None
+
+
+def project_item_issue_keys(grouped: OrderedDict[str, list[dict[str, Any]]]) -> set[tuple[str, str, int]]:
+    keys: set[tuple[str, str, int]] = set()
+    for items in grouped.values():
+        for item in items:
+            key = issue_key_for_item(item)
+            if key:
+                keys.add(key)
+    return keys
+
+
+def synthetic_sub_issue_item(
+    sub_issue: dict[str, Any],
+    parent_item: dict[str, Any],
+    parent_title: str,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "id": f"sub_issue:{sub_issue.get('id') or sub_issue.get('url') or sub_issue.get('number')}",
+        "type": "ISSUE",
+        "isArchived": bool(parent_item.get("isArchived")),
+        "content": sub_issue,
+        SUB_ISSUE_PARENT_TITLE_KEY: parent_title,
+    }
+
+    if ARCHIVED_FROM_COLUMN_KEY in parent_item:
+        item[ARCHIVED_FROM_COLUMN_KEY] = parent_item[ARCHIVED_FROM_COLUMN_KEY]
+
+    return item
+
+
+def add_sub_issues_to_grouped_items(
+    client: GitHubClient,
+    grouped: OrderedDict[str, list[dict[str, Any]]],
+) -> OrderedDict[str, list[dict[str, Any]]]:
+    """Insert missing sub-issues after their parent item and annotate known sub-issue cards.
+
+    If a sub-issue is already present as a Project item, it stays in its normal Project
+    column/order and only receives the parent-title heading suffix. Sub-issues that are
+    not Project items are inserted directly after their parent, in the parent's section.
+    """
+    project_keys = project_item_issue_keys(grouped)
+    synthetic_keys: set[tuple[str, str, int]] = set()
+    parent_title_by_key: dict[tuple[str, str, int], str] = {}
+    sub_issue_cache: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+
+    def direct_sub_issue_contents(issue: dict[str, Any]) -> list[dict[str, Any]]:
+        if not issue_can_have_sub_issues(issue):
+            return []
+
+        key = issue_key(issue)
+        details = issue_repository_details(issue)
+        if not key or not details:
+            return []
+
+        if key in sub_issue_cache:
+            return sub_issue_cache[key]
+
+        repo_owner, repo_name, issue_number = details
+        sub_issues: list[dict[str, Any]] = []
+        for sub_issue in iter_sub_issues(client, repo_owner, repo_name, issue_number):
+            if isinstance(sub_issue, dict):
+                sub_issues.append(rest_issue_to_project_content(sub_issue, repo_owner, repo_name))
+
+        sub_issue_cache[key] = sub_issues
+        return sub_issues
+
+    def expand_item(item: dict[str, Any], ancestors: set[tuple[str, str, int]]) -> list[dict[str, Any]]:
+        content = item.get("content")
+        if not isinstance(content, dict):
+            return [item]
+
+        parent_key = issue_key(content)
+        if parent_key and parent_key in ancestors:
+            return [item]
+
+        next_ancestors = set(ancestors)
+        if parent_key:
+            next_ancestors.add(parent_key)
+
+        expanded = [item]
+        parent_title = heading_text(content.get("title"))
+
+        for sub_issue in direct_sub_issue_contents(content):
+            sub_key = issue_key(sub_issue)
+            if not sub_key or sub_key in next_ancestors:
+                continue
+
+            parent_title_by_key.setdefault(sub_key, parent_title)
+
+            if sub_key in project_keys or sub_key in synthetic_keys:
+                continue
+
+            synthetic_keys.add(sub_key)
+            sub_item = synthetic_sub_issue_item(sub_issue, item, parent_title)
+            expanded.extend(expand_item(sub_item, next_ancestors))
+
+        return expanded
+
+    expanded_grouped: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+    for column, items in grouped.items():
+        expanded_items: list[dict[str, Any]] = []
+        for item in items:
+            expanded_items.extend(expand_item(item, set()))
+        expanded_grouped[column] = expanded_items
+
+    for items in expanded_grouped.values():
+        for item in items:
+            key = issue_key_for_item(item)
+            if key and key in parent_title_by_key:
+                item.setdefault(SUB_ISSUE_PARENT_TITLE_KEY, parent_title_by_key[key])
+
+    ensure_archived_section_at_end(expanded_grouped)
+    return expanded_grouped
 
 
 def group_project_items(
@@ -1272,6 +1537,7 @@ def build_markdown(
     entry_count = 0
     comment_count = 0
     timeline_event_count = 0
+    sub_issue_count = 0
 
     for column, items in grouped.items():
         lines.append(f"# {heading_text(markdown_section_heading(column))}")
@@ -1279,11 +1545,10 @@ def build_markdown(
 
         for item in items:
             issue = item["content"]
-            if column == ARCHIVED_SECTION_KEY:
-                issue_heading = archived_issue_heading(issue, item)
-            else:
-                issue_heading = heading_text(issue.get("title"))
-            lines.append(f"## {issue_heading}")
+            if item.get(SUB_ISSUE_PARENT_TITLE_KEY):
+                sub_issue_count += 1
+            heading = issue_heading(issue, item, column)
+            lines.append(f"## {heading}")
             lines.append("")
 
             repository = issue.get("repository") or {}
@@ -1323,6 +1588,7 @@ def build_markdown(
         "entries_exported": entry_count,
         "comments_exported": comment_count,
         "timeline_events_exported": timeline_event_count,
+        "sub_issue_items_exported": sub_issue_count,
     }
 
 
@@ -1348,6 +1614,9 @@ def export_project(project_url: str, output_path: Path, tz_name: str = DEFAULT_T
 
     print("Grouping project items...", file=sys.stderr)
     grouped, stats = group_project_items(client, project, column_field_name)
+
+    print("Loading sub-issues...", file=sys.stderr)
+    grouped = add_sub_issues_to_grouped_items(client, grouped)
 
     print("Building Markdown...", file=sys.stderr)
     markdown, markdown_stats = build_markdown(client, grouped, tz)
@@ -1400,6 +1669,7 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
         f"({stats['comments_exported']} comments/original posts and "
         f"{stats['timeline_events_exported']} timeline events) from "
         f"{stats['issue_or_pr_items']} issue/PR cards "
+        f"plus {stats['sub_issue_items_exported']} sub-issues "
         f"({stats['archived_issue_or_pr_items']} archived) "
         f"across {stats['columns_written']} columns "
         f"to {args.output}",
