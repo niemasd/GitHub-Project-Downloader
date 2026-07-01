@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Export the issue-comment history of a GitHub Projects v2 board to Markdown.
+Export the issue, comment, and timeline history of a GitHub Projects v2 board to Markdown.
 
 Usage:
     ./dl_gh_project.py --project PROJECT_URL --output OUTPUT.md
@@ -18,8 +18,8 @@ Notes:
         https://github.com/orgs/OWNER/projects/NUMBER
         https://github.com/users/OWNER/projects/NUMBER
         https://github.com/orgs/OWNER/projects/NUMBER/views/VIEW_NUMBER
-    - It exports issue comments and pull-request issue comments. It does not
-      export pull-request review comments or draft-project-item text.
+    - It exports issue opening posts, issue comments, and issue / pull-request timeline events.
+    - It does not export pull-request review comments or draft-project-item text.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import re
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 from urllib.error import HTTPError, URLError
@@ -45,7 +45,10 @@ API_VERSION = "2026-03-10"
 GRAPHQL_URL = "https://api.github.com/graphql"
 REST_BASE_URL = "https://api.github.com"
 DEFAULT_TZ = "UTC"
-USER_AGENT = "dl-gh-project/1.1"
+USER_AGENT = "dl-gh-project/1.3"
+ARCHIVED_COLUMN_NAME = "Archived"
+ARCHIVED_SECTION_KEY = "__dl_gh_project_archived_items__"
+ARCHIVED_FROM_COLUMN_KEY = "_dl_gh_project_archived_from_column"
 
 
 class GitHubAPIError(RuntimeError):
@@ -146,13 +149,18 @@ fragment ProjectInfo on ProjectV2 {
 
 
 ITEMS_QUERY = """
-query($projectId: ID!, $cursor: String, $columnFieldName: String!) {
+query(
+  $projectId: ID!,
+  $cursor: String,
+  $columnFieldName: String!,
+  $archivedStates: [ProjectV2ItemArchivedState!]!
+) {
   node(id: $projectId) {
     ... on ProjectV2 {
       items(
         first: 50,
         after: $cursor,
-        archivedStates: [NOT_ARCHIVED],
+        archivedStates: $archivedStates,
         orderBy: {field: POSITION, direction: ASC}
       ) {
         pageInfo {
@@ -256,10 +264,176 @@ query($projectId: ID!, $cursor: String, $columnFieldName: String!) {
 """
 
 
+PROJECT_V2_TIMELINE_QUERY = """
+query($contentId: ID!, $cursor: String) {
+  node(id: $contentId) {
+    __typename
+
+    ... on Issue {
+      timelineItems(
+        first: 100,
+        after: $cursor,
+        itemTypes: [
+          ADDED_TO_PROJECT_V2_EVENT,
+          PROJECT_V2_ITEM_STATUS_CHANGED_EVENT,
+          REMOVED_FROM_PROJECT_V2_EVENT,
+          CONVERTED_FROM_DRAFT_EVENT
+        ]
+      ) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          __typename
+
+          ... on AddedToProjectV2Event {
+            id
+            actor {
+              login
+            }
+            createdAt
+            project {
+              title
+              number
+              url
+            }
+            wasAutomated
+          }
+
+          ... on ProjectV2ItemStatusChangedEvent {
+            id
+            actor {
+              login
+            }
+            createdAt
+            previousStatus
+            status
+            project {
+              title
+              number
+              url
+            }
+            wasAutomated
+          }
+
+          ... on RemovedFromProjectV2Event {
+            id
+            actor {
+              login
+            }
+            createdAt
+            project {
+              title
+              number
+              url
+            }
+            wasAutomated
+          }
+
+          ... on ConvertedFromDraftEvent {
+            id
+            actor {
+              login
+            }
+            createdAt
+            project {
+              title
+              number
+              url
+            }
+            wasAutomated
+          }
+        }
+      }
+    }
+
+    ... on PullRequest {
+      timelineItems(
+        first: 100,
+        after: $cursor,
+        itemTypes: [
+          ADDED_TO_PROJECT_V2_EVENT,
+          PROJECT_V2_ITEM_STATUS_CHANGED_EVENT,
+          REMOVED_FROM_PROJECT_V2_EVENT,
+          CONVERTED_FROM_DRAFT_EVENT
+        ]
+      ) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          __typename
+
+          ... on AddedToProjectV2Event {
+            id
+            actor {
+              login
+            }
+            createdAt
+            project {
+              title
+              number
+              url
+            }
+            wasAutomated
+          }
+
+          ... on ProjectV2ItemStatusChangedEvent {
+            id
+            actor {
+              login
+            }
+            createdAt
+            previousStatus
+            status
+            project {
+              title
+              number
+              url
+            }
+            wasAutomated
+          }
+
+          ... on RemovedFromProjectV2Event {
+            id
+            actor {
+              login
+            }
+            createdAt
+            project {
+              title
+              number
+              url
+            }
+            wasAutomated
+          }
+
+          ... on ConvertedFromDraftEvent {
+            id
+            actor {
+              login
+            }
+            createdAt
+            project {
+              title
+              number
+              url
+            }
+            wasAutomated
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 def fine_grained_token_url(project_url: ProjectURL) -> str:
     params = {
         "name": "dl-gh-project",
-        "description": "Export GitHub Project issue comments to Markdown",
+        "description": "Export GitHub Project issue comments and timeline events to Markdown",
         "expires_in": "30",
         "metadata": "read",
         "issues": "read",
@@ -310,7 +484,7 @@ def token_prompt_instructions(project_url: ProjectURL) -> str:
 
     return (
         "No GitHub token was found in GITHUB_TOKEN or GH_TOKEN.\n\n"
-        "This script needs a token that can read the GitHub Project and the referenced issue / PR comments.\n\n"
+        "This script needs a token that can read the GitHub Project and the referenced issue / PR comments and timeline events.\n\n"
         f"{recommended}\n"
         f"{fallback}\n"
         "To avoid this prompt later, run one of these before calling the script:\n"
@@ -599,6 +773,7 @@ def iter_project_items(
     client: GitHubClient,
     project_id: str,
     column_field_name: str,
+    archived_states: Iterable[str],
 ) -> Iterator[dict[str, Any]]:
     cursor = None
 
@@ -609,6 +784,7 @@ def iter_project_items(
                 "projectId": project_id,
                 "cursor": cursor,
                 "columnFieldName": column_field_name,
+                "archivedStates": list(archived_states),
             },
         )
 
@@ -647,34 +823,52 @@ def column_name_for_item(item: dict[str, Any], column_field_name: str) -> str:
     return f"No {column_field_name}"
 
 
-def iter_issue_comments(
+def iter_issue_timeline_events(
     client: GitHubClient,
     owner: str,
     repo: str,
     issue_number: int,
 ) -> Iterator[dict[str, Any]]:
+    """Yield REST timeline events for an issue or pull request."""
     owner_q = quote(owner, safe="")
     repo_q = quote(repo, safe="")
-    path = f"/repos/{owner_q}/{repo_q}/issues/{issue_number}/comments"
+    path = f"/repos/{owner_q}/{repo_q}/issues/{issue_number}/timeline"
     yield from client.rest_get_paginated(path, params={"per_page": 100})
 
 
-def original_post_as_comment(issue: dict[str, Any]) -> dict[str, Any]:
-    """Return the Issue/PR opening body in the same shape as a REST issue comment."""
+def original_post_as_entry(issue: dict[str, Any]) -> dict[str, Any]:
+    """Return the Issue/PR opening body in the same shape as a Markdown timeline entry."""
     author = issue.get("author") or {}
     return {
-        "user": {"login": author.get("login") or "unknown"},
+        "kind": "comment",
+        "login": author.get("login") or "unknown",
         "created_at": issue.get("createdAt"),
         "body": issue.get("body") or "",
+        "dedupe_key": f"original:{issue.get('id') or issue.get('url') or issue.get('number')}",
     }
 
 
 def parse_github_datetime(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def format_github_datetime(value: str, tz: ZoneInfo) -> str:
     return parse_github_datetime(value).astimezone(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def human_event_date(value: str, tz: ZoneInfo) -> str:
+    if not value:
+        return "an unknown date"
+
+    try:
+        local_time = parse_github_datetime(value).astimezone(tz)
+    except ValueError:
+        return str(value)
+
+    return f"{local_time.strftime('%b')} {local_time.day}, {local_time.year}"
 
 
 def heading_text(value: Any) -> str:
@@ -682,15 +876,335 @@ def heading_text(value: Any) -> str:
     return text or "(untitled)"
 
 
-def comment_heading(comment: dict[str, Any], tz: ZoneInfo) -> str:
-    user = comment.get("user") or {}
-    login = user.get("login") or "unknown"
-    created_at = comment.get("created_at")
+def login_from_obj(value: Any) -> str | None:
+    if isinstance(value, dict):
+        login = value.get("login") or value.get("name")
+        return str(login) if login else None
+    if value:
+        return str(value)
+    return None
+
+
+def nested_name(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("name", "title", "login", "body", "html_url", "url"):
+            candidate = value.get(key)
+            if candidate:
+                return str(candidate)
+        return None
+    if value is not None:
+        return str(value)
+    return None
+
+
+def markdown_inline_code(value: Any) -> str:
+    text = str(value or "unknown").replace("`", "\\`")
+    return f"`{text}`"
+
+
+def timeline_entry_heading(entry: dict[str, Any], tz: ZoneInfo) -> str:
+    login = str(entry.get("login") or "unknown")
+    created_at = entry.get("created_at")
     if not created_at:
         created = "unknown time"
     else:
-        created = format_github_datetime(str(created_at), tz)
+        try:
+            created = format_github_datetime(str(created_at), tz)
+        except ValueError:
+            created = str(created_at)
     return f"### {login} - {created}"
+
+
+def project_card_field(event: dict[str, Any], field_name: str) -> str | None:
+    project_card = event.get("project_card")
+    if isinstance(project_card, dict):
+        value = project_card.get(field_name)
+        if value:
+            return str(value)
+    return None
+
+
+def event_body_for_rest_event(event: dict[str, Any], tz: ZoneInfo) -> str:
+    event_type = str(event.get("event") or "event").lower()
+    actor = login_from_obj(event.get("actor")) or login_from_obj(event.get("user")) or "unknown"
+    date_text = human_event_date(str(event.get("created_at") or ""), tz)
+
+    if event_type == "assigned":
+        assignee = login_from_obj(event.get("assignee")) or "unknown"
+        if assignee == actor:
+            return f"{actor} self-assigned this on {date_text}"
+        return f"{actor} assigned this to {assignee} on {date_text}"
+
+    if event_type == "unassigned":
+        assignee = login_from_obj(event.get("assignee")) or "unknown"
+        if assignee == actor:
+            return f"{actor} unassigned themselves from this on {date_text}"
+        return f"{actor} unassigned {assignee} from this on {date_text}"
+
+    if event_type == "labeled":
+        label = nested_name(event.get("label")) or "unknown"
+        return f"{actor} added {markdown_inline_code(label)} on {date_text}"
+
+    if event_type == "unlabeled":
+        label = nested_name(event.get("label")) or "unknown"
+        return f"{actor} removed {markdown_inline_code(label)} on {date_text}"
+
+    if event_type == "milestoned":
+        milestone = nested_name(event.get("milestone")) or "unknown"
+        return f"{actor} added this to the {markdown_inline_code(milestone)} milestone on {date_text}"
+
+    if event_type == "demilestoned":
+        milestone = nested_name(event.get("milestone")) or "unknown"
+        return f"{actor} removed this from the {markdown_inline_code(milestone)} milestone on {date_text}"
+
+    if event_type == "renamed":
+        rename = event.get("rename") or {}
+        old_title = rename.get("from") if isinstance(rename, dict) else None
+        new_title = rename.get("to") if isinstance(rename, dict) else None
+        if old_title and new_title:
+            return f"{actor} renamed this from {markdown_inline_code(old_title)} to {markdown_inline_code(new_title)} on {date_text}"
+        return f"{actor} renamed this on {date_text}"
+
+    if event_type == "closed":
+        return f"{actor} closed this on {date_text}"
+
+    if event_type == "reopened":
+        return f"{actor} reopened this on {date_text}"
+
+    if event_type == "locked":
+        reason = event.get("lock_reason")
+        if reason:
+            return f"{actor} locked this as {markdown_inline_code(reason)} on {date_text}"
+        return f"{actor} locked this on {date_text}"
+
+    if event_type == "unlocked":
+        return f"{actor} unlocked this on {date_text}"
+
+    if event_type == "merged":
+        return f"{actor} merged this on {date_text}"
+
+    if event_type == "referenced":
+        commit_id = event.get("commit_id")
+        if commit_id:
+            return f"{actor} referenced this from commit {markdown_inline_code(str(commit_id)[:12])} on {date_text}"
+        return f"{actor} referenced this on {date_text}"
+
+    if event_type == "cross-referenced":
+        source = event.get("source") or {}
+        issue = source.get("issue") if isinstance(source, dict) else None
+        title = nested_name(issue) if issue else None
+        if title:
+            return f"{actor} cross-referenced this from {markdown_inline_code(title)} on {date_text}"
+        return f"{actor} cross-referenced this on {date_text}"
+
+    if event_type == "review_requested":
+        requested_reviewer = login_from_obj(event.get("requested_reviewer")) or nested_name(event.get("requested_team")) or "unknown"
+        return f"{actor} requested a review from {requested_reviewer} on {date_text}"
+
+    if event_type == "review_request_removed":
+        requested_reviewer = login_from_obj(event.get("requested_reviewer")) or nested_name(event.get("requested_team")) or "unknown"
+        return f"{actor} removed the review request for {requested_reviewer} on {date_text}"
+
+    if event_type == "added_to_project":
+        project_name = project_card_field(event, "project_name") or project_card_field(event, "project_url") or "a project"
+        column_name = project_card_field(event, "column_name")
+        if column_name:
+            return f"{actor} added this to {project_name} in {markdown_inline_code(column_name)} on {date_text}"
+        return f"{actor} added this to {project_name} on {date_text}"
+
+    if event_type == "moved_columns_in_project":
+        project_name = project_card_field(event, "project_name") or project_card_field(event, "project_url") or "a project"
+        previous_column = project_card_field(event, "previous_column_name")
+        column_name = project_card_field(event, "column_name")
+        if previous_column and column_name:
+            return f"{actor} moved this in {project_name} from {markdown_inline_code(previous_column)} to {markdown_inline_code(column_name)} on {date_text}"
+        if column_name:
+            return f"{actor} moved this in {project_name} to {markdown_inline_code(column_name)} on {date_text}"
+        return f"{actor} moved this in {project_name} on {date_text}"
+
+    if event_type == "removed_from_project":
+        project_name = project_card_field(event, "project_name") or project_card_field(event, "project_url") or "a project"
+        return f"{actor} removed this from {project_name} on {date_text}"
+
+    if event_type == "converted_note_to_issue":
+        return f"{actor} converted this note to an issue on {date_text}"
+
+    if event_type == "comment_deleted":
+        return f"{actor} deleted a comment on {date_text}"
+
+    if event_type in {"pinned", "unpinned", "subscribed", "unsubscribed", "mentioned", "transferred"}:
+        action = event_type.replace("_", " ").replace("-", " ")
+        return f"{actor} {action} this on {date_text}"
+
+    action = event_type.replace("_", " ").replace("-", " ")
+    return f"{actor} {action} this on {date_text}"
+
+
+def rest_timeline_event_as_entry(event: dict[str, Any], tz: ZoneInfo) -> dict[str, Any]:
+    event_type = str(event.get("event") or "event").lower()
+    is_comment = event_type == "commented"
+    login = login_from_obj(event.get("user")) or login_from_obj(event.get("actor")) or "unknown"
+    created_at = event.get("created_at") or event.get("submitted_at") or event.get("createdAt")
+    identifier = event.get("node_id") or event.get("id") or event.get("url") or f"{event_type}:{login}:{created_at}"
+
+    return {
+        "kind": "comment" if is_comment else "event",
+        "login": login,
+        "created_at": created_at,
+        "body": event.get("body") or "" if is_comment else event_body_for_rest_event(event, tz),
+        "dedupe_key": f"rest:{identifier}",
+    }
+
+
+def iter_project_v2_timeline_events(client: GitHubClient, content_id: str) -> Iterator[dict[str, Any]]:
+    cursor = None
+    expected_types = {
+        "AddedToProjectV2Event",
+        "ProjectV2ItemStatusChangedEvent",
+        "RemovedFromProjectV2Event",
+        "ConvertedFromDraftEvent",
+    }
+
+    while True:
+        data = client.graphql(
+            PROJECT_V2_TIMELINE_QUERY,
+            {
+                "contentId": content_id,
+                "cursor": cursor,
+            },
+        )
+
+        node = data.get("node")
+        if not isinstance(node, dict):
+            return
+
+        timeline_items = node.get("timelineItems")
+        if not isinstance(timeline_items, dict):
+            return
+
+        for event in safe_nodes(timeline_items):
+            if event.get("__typename") in expected_types:
+                yield event
+
+        page_info = timeline_items.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+
+
+def project_title_from_event(event: dict[str, Any]) -> str:
+    project = event.get("project")
+    if isinstance(project, dict):
+        return str(project.get("title") or project.get("url") or "Project")
+    return "Project"
+
+
+def body_for_project_v2_event(event: dict[str, Any], tz: ZoneInfo) -> str:
+    typename = str(event.get("__typename") or "ProjectV2Event")
+    actor = login_from_obj(event.get("actor")) or "unknown"
+    date_text = human_event_date(str(event.get("createdAt") or ""), tz)
+    project_title = project_title_from_event(event)
+
+    if typename == "AddedToProjectV2Event":
+        return f"{actor} added this to {project_title} on {date_text}"
+
+    if typename == "ProjectV2ItemStatusChangedEvent":
+        previous_status = event.get("previousStatus")
+        status = event.get("status")
+        if previous_status and status:
+            return f"{actor} moved this in {project_title} from {markdown_inline_code(previous_status)} to {markdown_inline_code(status)} on {date_text}"
+        if status:
+            return f"{actor} set this in {project_title} to {markdown_inline_code(status)} on {date_text}"
+        return f"{actor} changed this item's status in {project_title} on {date_text}"
+
+    if typename == "RemovedFromProjectV2Event":
+        return f"{actor} removed this from {project_title} on {date_text}"
+
+    if typename == "ConvertedFromDraftEvent":
+        return f"{actor} converted this from a draft issue in {project_title} on {date_text}"
+
+    return f"{actor} updated this in {project_title} on {date_text}"
+
+
+def project_v2_event_as_entry(event: dict[str, Any], tz: ZoneInfo) -> dict[str, Any]:
+    typename = str(event.get("__typename") or "ProjectV2Event")
+    identifier = event.get("id") or f"{typename}:{event.get('createdAt')}:{project_title_from_event(event)}"
+    return {
+        "kind": "event",
+        "login": login_from_obj(event.get("actor")) or "unknown",
+        "created_at": event.get("createdAt"),
+        "body": body_for_project_v2_event(event, tz),
+        "dedupe_key": f"graphql:{identifier}",
+    }
+
+
+def timeline_sort_value(entry: dict[str, Any]) -> datetime:
+    created_at = entry.get("created_at")
+    if created_at:
+        try:
+            return parse_github_datetime(str(created_at))
+        except ValueError:
+            pass
+    return datetime.max.replace(tzinfo=timezone.utc)
+
+
+def collect_issue_timeline_entries(
+    client: GitHubClient,
+    repo_owner: str,
+    repo_name: str,
+    issue_number: int,
+    issue: dict[str, Any],
+    tz: ZoneInfo,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_entry(entry: dict[str, Any]) -> None:
+        key = str(entry.get("dedupe_key") or f"{entry.get('kind')}:{entry.get('login')}:{entry.get('created_at')}:{entry.get('body')}")
+        if key in seen:
+            return
+        entry["_order"] = len(entries)
+        seen.add(key)
+        entries.append(entry)
+
+    add_entry(original_post_as_entry(issue))
+
+    for event in iter_issue_timeline_events(client, repo_owner, repo_name, issue_number):
+        if isinstance(event, dict):
+            add_entry(rest_timeline_event_as_entry(event, tz))
+
+    content_id = issue.get("id")
+    if content_id:
+        for event in iter_project_v2_timeline_events(client, str(content_id)):
+            add_entry(project_v2_event_as_entry(event, tz))
+
+    entries.sort(key=lambda entry: (timeline_sort_value(entry), int(entry.get("_order", 0))))
+    return entries
+
+
+def ensure_archived_section_at_end(grouped: OrderedDict[str, list[dict[str, Any]]]) -> None:
+    """Ensure the synthetic archive section exists and is the final section.
+
+    This uses an internal key instead of the visible heading text so a real
+    project column named "Archived" is not merged with the synthetic archive
+    section.
+    """
+    archived_items = grouped.pop(ARCHIVED_SECTION_KEY, [])
+    grouped[ARCHIVED_SECTION_KEY] = archived_items
+
+
+def markdown_section_heading(column_key: str) -> str:
+    if column_key == ARCHIVED_SECTION_KEY:
+        return ARCHIVED_COLUMN_NAME
+    return column_key
+
+
+def archived_issue_heading(issue: dict[str, Any], item: dict[str, Any]) -> str:
+    archived_from = item.get(ARCHIVED_FROM_COLUMN_KEY) or "unknown column"
+    return (
+        f"{heading_text(issue.get('title'))} "
+        f'(archived from "{heading_text(archived_from)}")'
+    )
 
 
 def group_project_items(
@@ -700,15 +1214,17 @@ def group_project_items(
 ) -> tuple[OrderedDict[str, list[dict[str, Any]]], dict[str, int]]:
     columns = ordered_column_names(project, column_field_name)
     grouped: OrderedDict[str, list[dict[str, Any]]] = OrderedDict((column, []) for column in columns)
+    ensure_archived_section_at_end(grouped)
     stats = {
         "items_seen": 0,
         "issue_or_pr_items": 0,
+        "archived_issue_or_pr_items": 0,
         "draft_items_skipped": 0,
         "redacted_items_skipped": 0,
         "other_items_skipped": 0,
     }
 
-    for item in iter_project_items(client, project["id"], column_field_name):
+    def record_item(item: dict[str, Any], *, archived: bool) -> None:
         stats["items_seen"] += 1
         content = item.get("content")
         content_type = content.get("__typename") if isinstance(content, dict) else None
@@ -720,12 +1236,30 @@ def group_project_items(
                 stats["redacted_items_skipped"] += 1
             else:
                 stats["other_items_skipped"] += 1
-            continue
+            return
 
         stats["issue_or_pr_items"] += 1
         column = column_name_for_item(item, column_field_name)
+
+        if archived:
+            stats["archived_issue_or_pr_items"] += 1
+            archived_item = dict(item)
+            archived_item[ARCHIVED_FROM_COLUMN_KEY] = column
+            grouped.setdefault(ARCHIVED_SECTION_KEY, []).append(archived_item)
+            ensure_archived_section_at_end(grouped)
+            return
+
         grouped.setdefault(column, []).append(item)
 
+    for item in iter_project_items(client, project["id"], column_field_name, ("NOT_ARCHIVED",)):
+        record_item(item, archived=False)
+
+    ensure_archived_section_at_end(grouped)
+
+    for item in iter_project_items(client, project["id"], column_field_name, ("ARCHIVED",)):
+        record_item(item, archived=True)
+
+    ensure_archived_section_at_end(grouped)
     return grouped, stats
 
 
@@ -733,17 +1267,23 @@ def build_markdown(
     client: GitHubClient,
     grouped: OrderedDict[str, list[dict[str, Any]]],
     tz: ZoneInfo,
-) -> tuple[str, int]:
+) -> tuple[str, dict[str, int]]:
     lines: list[str] = []
+    entry_count = 0
     comment_count = 0
+    timeline_event_count = 0
 
     for column, items in grouped.items():
-        lines.append(f"# {heading_text(column)}")
+        lines.append(f"# {heading_text(markdown_section_heading(column))}")
         lines.append("")
 
         for item in items:
             issue = item["content"]
-            lines.append(f"## {heading_text(issue.get('title'))}")
+            if column == ARCHIVED_SECTION_KEY:
+                issue_heading = archived_issue_heading(issue, item)
+            else:
+                issue_heading = heading_text(issue.get("title"))
+            lines.append(f"## {issue_heading}")
             lines.append("")
 
             repository = issue.get("repository") or {}
@@ -753,26 +1293,37 @@ def build_markdown(
             issue_number = issue.get("number")
 
             if not repo_owner or not repo_name or not issue_number:
-                lines.append("<!-- Skipped comments: missing repository or issue number in API response. -->")
+                lines.append("<!-- Skipped timeline: missing repository or issue number in API response. -->")
                 lines.append("")
                 continue
 
-            original_post = original_post_as_comment(issue)
-            comment_count += 1
-            lines.append(comment_heading(original_post, tz))
-            lines.append("")
-            lines.append(original_post.get("body") or "")
-            lines.append("")
+            entries = collect_issue_timeline_entries(
+                client,
+                str(repo_owner),
+                str(repo_name),
+                int(issue_number),
+                issue,
+                tz,
+            )
 
-            for comment in iter_issue_comments(client, str(repo_owner), str(repo_name), int(issue_number)):
-                comment_count += 1
-                lines.append(comment_heading(comment, tz))
+            for entry in entries:
+                entry_count += 1
+                if entry.get("kind") == "comment":
+                    comment_count += 1
+                else:
+                    timeline_event_count += 1
+
+                lines.append(timeline_entry_heading(entry, tz))
                 lines.append("")
-                lines.append(comment.get("body") or "")
+                lines.append(str(entry.get("body") or ""))
                 lines.append("")
 
     # End files with exactly one newline.
-    return "\n".join(lines).rstrip() + "\n", comment_count
+    return "\n".join(lines).rstrip() + "\n", {
+        "entries_exported": entry_count,
+        "comments_exported": comment_count,
+        "timeline_events_exported": timeline_event_count,
+    }
 
 
 def export_project(project_url: str, output_path: Path, tz_name: str = DEFAULT_TZ) -> dict[str, int | str]:
@@ -799,15 +1350,15 @@ def export_project(project_url: str, output_path: Path, tz_name: str = DEFAULT_T
     grouped, stats = group_project_items(client, project, column_field_name)
 
     print("Building Markdown...", file=sys.stderr)
-    markdown, comment_count = build_markdown(client, grouped, tz)
+    markdown, markdown_stats = build_markdown(client, grouped, tz)
 
-    print(f"Writing Markdown to file: {markdown}", file=sys.stderr)
+    print(f"Writing Markdown to file: {output_path}", file=sys.stderr)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown, encoding="utf-8")
 
     return {
         **stats,
-        "comments_exported": comment_count,
+        **markdown_stats,
         "columns_written": len(grouped),
         "project_title": str(project.get("title") or ""),
         "column_field": column_field_name,
@@ -817,7 +1368,7 @@ def export_project(project_url: str, output_path: Path, tz_name: str = DEFAULT_T
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export all issue comments from a GitHub Projects v2 board to Markdown.",
+        description="Export issue comments and timeline events from a GitHub Projects v2 board to Markdown.",
     )
     parser.add_argument(
         "-p",
@@ -845,8 +1396,11 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
 
     print(
         "Exported "
-        f"{stats['comments_exported']} comments from "
+        f"{stats['entries_exported']} Markdown entries "
+        f"({stats['comments_exported']} comments/original posts and "
+        f"{stats['timeline_events_exported']} timeline events) from "
         f"{stats['issue_or_pr_items']} issue/PR cards "
+        f"({stats['archived_issue_or_pr_items']} archived) "
         f"across {stats['columns_written']} columns "
         f"to {args.output}",
         file=sys.stderr,
