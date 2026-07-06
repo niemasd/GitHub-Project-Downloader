@@ -46,11 +46,12 @@ API_VERSION = "2026-03-10"
 GRAPHQL_URL = "https://api.github.com/graphql"
 REST_BASE_URL = "https://api.github.com"
 DEFAULT_TZ = "UTC"
-USER_AGENT = "dl-gh-project/1.4"
+USER_AGENT = "dl-gh-project-v2/1.5"
 ARCHIVED_COLUMN_NAME = "Archived"
 ARCHIVED_SECTION_KEY = "__dl_gh_project_archived_items__"
 ARCHIVED_FROM_COLUMN_KEY = "_dl_gh_project_archived_from_column"
 SUB_ISSUE_PARENT_TITLE_KEY = "_dl_gh_project_sub_issue_parent_title"
+SUB_ISSUE_PARENT_KEY_KEY = "_dl_gh_project_sub_issue_parent_key"
 
 
 class GitHubAPIError(RuntimeError):
@@ -1260,6 +1261,14 @@ def timeline_sort_value(entry: dict[str, Any]) -> datetime:
     return datetime.max.replace(tzinfo=timezone.utc)
 
 
+def should_omit_timeline_entry(entry: dict[str, Any]) -> bool:
+    """Return True for noisy technical timeline events that should not be exported."""
+    if entry.get("kind") != "event":
+        return False
+    body = str(entry.get("body") or "")
+    return "project v2" in body.casefold()
+
+
 def collect_issue_timeline_entries(
     client: GitHubClient,
     repo_owner: str,
@@ -1272,6 +1281,9 @@ def collect_issue_timeline_entries(
     seen: set[str] = set()
 
     def add_entry(entry: dict[str, Any]) -> None:
+        if should_omit_timeline_entry(entry):
+            return
+
         key = str(entry.get("dedupe_key") or f"{entry.get('kind')}:{entry.get('login')}:{entry.get('created_at')}:{entry.get('body')}")
         if key in seen:
             return
@@ -1311,27 +1323,150 @@ def markdown_section_heading(column_key: str) -> str:
     return column_key
 
 
-def archived_issue_heading(issue: dict[str, Any], item: dict[str, Any]) -> str:
+def markdown_link_text(value: Any) -> str:
+    """Escape text for use inside a Markdown inline-link label."""
+    text = str(value or "")
+    return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def markdown_heading_plain_text(value: str) -> str:
+    """Return approximate rendered text for a Markdown heading.
+
+    This is used only to build GitHub-style heading anchors. It strips common
+    inline Markdown forms whose visible text is what GitHub uses for the slug.
+    """
+    text = str(value or "")
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text
+
+
+def github_heading_slug(value: str) -> str:
+    """Return a GitHub-style slug for a Markdown heading."""
+    text = markdown_heading_plain_text(value).strip().lower()
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", "-", text)
+    return text.strip("-")
+
+
+class HeadingAnchorTracker:
+    """Track duplicate GitHub-style heading anchors in render order."""
+
+    def __init__(self) -> None:
+        self._seen: dict[str, int] = {}
+
+    def anchor_for(self, heading: str) -> str:
+        slug = github_heading_slug(heading)
+        count = self._seen.get(slug, 0)
+        self._seen[slug] = count + 1
+        if count:
+            return f"{slug}-{count}"
+        return slug
+
+
+def archived_issue_heading(
+    issue: dict[str, Any],
+    item: dict[str, Any],
+    parent_anchor_by_key: dict[tuple[str, str, int], str] | None = None,
+    parent_anchor_by_title: dict[str, str] | None = None,
+) -> str:
     archived_from = item.get(ARCHIVED_FROM_COLUMN_KEY) or "unknown column"
     return (
-        f"{issue_base_heading(issue, item)} "
+        f"{issue_base_heading(issue, item, parent_anchor_by_key, parent_anchor_by_title)} "
         f'(archived from "{heading_text(archived_from)}")'
     )
 
 
-def issue_base_heading(issue: dict[str, Any], item: dict[str, Any]) -> str:
-    title = heading_text(issue.get("title"))
+def sub_issue_parent_reference(
+    item: dict[str, Any],
+    parent_anchor_by_key: dict[tuple[str, str, int], str] | None = None,
+    parent_anchor_by_title: dict[str, str] | None = None,
+) -> str | None:
     parent_title = item.get(SUB_ISSUE_PARENT_TITLE_KEY)
-    if parent_title:
-        title = f'{title} (sub-issue of "{heading_text(parent_title)}")'
+    if not parent_title:
+        return None
+
+    parent_text = heading_text(parent_title)
+    parent_anchor = None
+    parent_key = item.get(SUB_ISSUE_PARENT_KEY_KEY)
+    if parent_anchor_by_key and isinstance(parent_key, tuple):
+        parent_anchor = parent_anchor_by_key.get(parent_key)
+    if not parent_anchor and parent_anchor_by_title:
+        parent_anchor = parent_anchor_by_title.get(parent_text)
+
+    if not parent_anchor:
+        return parent_text
+
+    return f"[{markdown_link_text(parent_text)}](#{parent_anchor})"
+
+
+def issue_base_heading(
+    issue: dict[str, Any],
+    item: dict[str, Any],
+    parent_anchor_by_key: dict[tuple[str, str, int], str] | None = None,
+    parent_anchor_by_title: dict[str, str] | None = None,
+) -> str:
+    title = heading_text(issue.get("title"))
+    parent_reference = sub_issue_parent_reference(item, parent_anchor_by_key, parent_anchor_by_title)
+    if parent_reference:
+        title = f'{title} (sub-issue of "{parent_reference}")'
     return title
 
 
-def issue_heading(issue: dict[str, Any], item: dict[str, Any], column: str) -> str:
+def issue_heading(
+    issue: dict[str, Any],
+    item: dict[str, Any],
+    column: str,
+    parent_anchor_by_key: dict[tuple[str, str, int], str] | None = None,
+    parent_anchor_by_title: dict[str, str] | None = None,
+) -> str:
     if column == ARCHIVED_SECTION_KEY:
-        return archived_issue_heading(issue, item)
-    return issue_base_heading(issue, item)
+        return archived_issue_heading(issue, item, parent_anchor_by_key, parent_anchor_by_title)
+    return issue_base_heading(issue, item, parent_anchor_by_key, parent_anchor_by_title)
 
+
+def compute_issue_heading_anchors(
+    grouped: OrderedDict[str, list[dict[str, Any]]],
+) -> tuple[dict[tuple[str, str, int], str], dict[str, str]]:
+    """Precompute anchors for generated issue headings.
+
+    GitHub de-duplicates heading anchors by render order. Including the top-level
+    column headings here keeps links correct when a column and an issue share the
+    same heading text. Timeline-entry headings are not known until issue histories
+    are fetched, but they are extremely unlikely to collide with issue titles.
+    """
+    tracker = HeadingAnchorTracker()
+    anchor_by_key: dict[tuple[str, str, int], str] = {}
+    anchor_by_title: dict[str, str] = {}
+
+    for column, items in grouped.items():
+        tracker.anchor_for(heading_text(markdown_section_heading(column)))
+
+        for item in items:
+            issue = item.get("content")
+            if not isinstance(issue, dict):
+                continue
+
+            heading = issue_heading(issue, item, column)
+            anchor = tracker.anchor_for(heading)
+
+            key = issue_key(issue)
+            if key and key not in anchor_by_key:
+                anchor_by_key[key] = anchor
+
+            title = heading_text(issue.get("title"))
+            anchor_by_title.setdefault(title, anchor)
+
+    return anchor_by_key, anchor_by_title
+
+
+def issue_url(issue: dict[str, Any]) -> str | None:
+    url = issue.get("url")
+    if not url:
+        return None
+    return str(url)
 
 def issue_repository_details(issue: dict[str, Any]) -> tuple[str, str, int] | None:
     repository = issue.get("repository") or {}
@@ -1372,6 +1507,7 @@ def synthetic_sub_issue_item(
     sub_issue: dict[str, Any],
     parent_item: dict[str, Any],
     parent_title: str,
+    parent_key: tuple[str, str, int] | None,
 ) -> dict[str, Any]:
     item: dict[str, Any] = {
         "id": f"sub_issue:{sub_issue.get('id') or sub_issue.get('url') or sub_issue.get('number')}",
@@ -1380,6 +1516,9 @@ def synthetic_sub_issue_item(
         "content": sub_issue,
         SUB_ISSUE_PARENT_TITLE_KEY: parent_title,
     }
+
+    if parent_key:
+        item[SUB_ISSUE_PARENT_KEY_KEY] = parent_key
 
     if ARCHIVED_FROM_COLUMN_KEY in parent_item:
         item[ARCHIVED_FROM_COLUMN_KEY] = parent_item[ARCHIVED_FROM_COLUMN_KEY]
@@ -1400,6 +1539,7 @@ def add_sub_issues_to_grouped_items(
     project_keys = project_item_issue_keys(grouped)
     synthetic_keys: set[tuple[str, str, int]] = set()
     parent_title_by_key: dict[tuple[str, str, int], str] = {}
+    parent_key_by_key: dict[tuple[str, str, int], tuple[str, str, int]] = {}
     sub_issue_cache: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
 
     def direct_sub_issue_contents(issue: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1445,12 +1585,14 @@ def add_sub_issues_to_grouped_items(
                 continue
 
             parent_title_by_key.setdefault(sub_key, parent_title)
+            if parent_key:
+                parent_key_by_key.setdefault(sub_key, parent_key)
 
             if sub_key in project_keys or sub_key in synthetic_keys:
                 continue
 
             synthetic_keys.add(sub_key)
-            sub_item = synthetic_sub_issue_item(sub_issue, item, parent_title)
+            sub_item = synthetic_sub_issue_item(sub_issue, item, parent_title, parent_key)
             expanded.extend(expand_item(sub_item, next_ancestors))
 
         return expanded
@@ -1467,6 +1609,8 @@ def add_sub_issues_to_grouped_items(
             key = issue_key_for_item(item)
             if key and key in parent_title_by_key:
                 item.setdefault(SUB_ISSUE_PARENT_TITLE_KEY, parent_title_by_key[key])
+                if key in parent_key_by_key:
+                    item.setdefault(SUB_ISSUE_PARENT_KEY_KEY, parent_key_by_key[key])
 
     ensure_archived_section_at_end(expanded_grouped)
     return expanded_grouped
@@ -1538,6 +1682,7 @@ def build_markdown(
     comment_count = 0
     timeline_event_count = 0
     sub_issue_count = 0
+    parent_anchor_by_key, parent_anchor_by_title = compute_issue_heading_anchors(grouped)
 
     for column, items in grouped.items():
         lines.append(f"# {heading_text(markdown_section_heading(column))}")
@@ -1547,9 +1692,14 @@ def build_markdown(
             issue = item["content"]
             if item.get(SUB_ISSUE_PARENT_TITLE_KEY):
                 sub_issue_count += 1
-            heading = issue_heading(issue, item, column)
+            heading = issue_heading(issue, item, column, parent_anchor_by_key, parent_anchor_by_title)
             lines.append(f"## {heading}")
             lines.append("")
+
+            url = issue_url(issue)
+            if url:
+                lines.append(f"* **URL:** [{url}]({url})")
+                lines.append("")
 
             repository = issue.get("repository") or {}
             owner_obj = repository.get("owner") or {}
