@@ -41,6 +41,7 @@ from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from tqdm import tqdm
 
 API_VERSION = "2026-03-10"
 GRAPHQL_URL = "https://api.github.com/graphql"
@@ -1600,11 +1601,11 @@ def add_sub_issues_to_grouped_items(
     expanded_grouped: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
     for column, items in grouped.items():
         expanded_items: list[dict[str, Any]] = []
-        for item in items:
+        for item in tqdm(items, desc=column):
             expanded_items.extend(expand_item(item, set()))
         expanded_grouped[column] = expanded_items
 
-    for items in expanded_grouped.values():
+    for items in tqdm(expanded_grouped.values(), desc="Expanded"):
         for item in items:
             key = issue_key_for_item(item)
             if key and key in parent_title_by_key:
@@ -1660,12 +1661,12 @@ def group_project_items(
 
         grouped.setdefault(column, []).append(item)
 
-    for item in iter_project_items(client, project["id"], column_field_name, ("NOT_ARCHIVED",)):
+    for item in tqdm(iter_project_items(client, project["id"], column_field_name, ("NOT_ARCHIVED",)), desc="Current"):
         record_item(item, archived=False)
 
     ensure_archived_section_at_end(grouped)
 
-    for item in iter_project_items(client, project["id"], column_field_name, ("ARCHIVED",)):
+    for item in tqdm(iter_project_items(client, project["id"], column_field_name, ("ARCHIVED",)), desc="Archived"):
         record_item(item, archived=True)
 
     ensure_archived_section_at_end(grouped)
@@ -1688,7 +1689,7 @@ def build_markdown(
         lines.append(f"# {heading_text(markdown_section_heading(column))}")
         lines.append("")
 
-        for item in items:
+        for item in tqdm(items, desc=column):
             issue = item["content"]
             if item.get(SUB_ISSUE_PARENT_TITLE_KEY):
                 sub_issue_count += 1
