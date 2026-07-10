@@ -1330,6 +1330,11 @@ def markdown_link_text(value: Any) -> str:
     return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
+def markdown_code_link_label(value: Any) -> str:
+    """Return inline-code text suitable for use as a Markdown link label."""
+    return markdown_inline_code(markdown_link_text(value))
+
+
 def markdown_heading_plain_text(value: str) -> str:
     """Return approximate rendered text for a Markdown heading.
 
@@ -1372,18 +1377,39 @@ def archived_issue_heading(
     item: dict[str, Any],
     parent_anchor_by_key: dict[tuple[str, str, int], str] | None = None,
     parent_anchor_by_title: dict[str, str] | None = None,
+    parent_label_by_key: dict[tuple[str, str, int], str] | None = None,
 ) -> str:
     archived_from = item.get(ARCHIVED_FROM_COLUMN_KEY) or "unknown column"
     return (
-        f"{issue_base_heading(issue, item, parent_anchor_by_key, parent_anchor_by_title)} "
+        f"{issue_base_heading(issue, item, parent_anchor_by_key, parent_anchor_by_title, parent_label_by_key)} "
         f'(archived from "{heading_text(archived_from)}")'
     )
+
+
+def issue_reference_label(issue: dict[str, Any]) -> str | None:
+    """Return the visible owner/repository issue reference used in issue headings."""
+    details = issue_repository_details(issue)
+    if not details:
+        return None
+
+    repo_owner, repo_name, issue_number = details
+    return f"{repo_owner}/{repo_name} #{issue_number}"
+
+
+def issue_heading_link(issue: dict[str, Any]) -> str | None:
+    """Return the absolute GitHub issue/PR link used at the start of a heading."""
+    label = issue_reference_label(issue)
+    url = issue_url(issue)
+    if not label or not url:
+        return None
+    return f"[{markdown_code_link_label(label)}]({url})"
 
 
 def sub_issue_parent_reference(
     item: dict[str, Any],
     parent_anchor_by_key: dict[tuple[str, str, int], str] | None = None,
     parent_anchor_by_title: dict[str, str] | None = None,
+    parent_label_by_key: dict[tuple[str, str, int], str] | None = None,
 ) -> str | None:
     parent_title = item.get(SUB_ISSUE_PARENT_TITLE_KEY)
     if not parent_title:
@@ -1391,16 +1417,25 @@ def sub_issue_parent_reference(
 
     parent_text = heading_text(parent_title)
     parent_anchor = None
+    parent_label = None
     parent_key = item.get(SUB_ISSUE_PARENT_KEY_KEY)
+    if parent_label_by_key and isinstance(parent_key, tuple):
+        parent_label = parent_label_by_key.get(parent_key)
     if parent_anchor_by_key and isinstance(parent_key, tuple):
         parent_anchor = parent_anchor_by_key.get(parent_key)
     if not parent_anchor and parent_anchor_by_title:
         parent_anchor = parent_anchor_by_title.get(parent_text)
 
-    if not parent_anchor:
-        return parent_text
+    label = parent_label or parent_text
 
-    return f"[{markdown_link_text(parent_text)}](#{parent_anchor})"
+    if not parent_anchor:
+        if parent_label:
+            return markdown_inline_code(label)
+        return label
+
+    if parent_label:
+        return f"[{markdown_code_link_label(label)}](#{parent_anchor})"
+    return f"[{markdown_link_text(label)}](#{parent_anchor})"
 
 
 def issue_base_heading(
@@ -1408,11 +1443,21 @@ def issue_base_heading(
     item: dict[str, Any],
     parent_anchor_by_key: dict[tuple[str, str, int], str] | None = None,
     parent_anchor_by_title: dict[str, str] | None = None,
+    parent_label_by_key: dict[tuple[str, str, int], str] | None = None,
 ) -> str:
     title = heading_text(issue.get("title"))
-    parent_reference = sub_issue_parent_reference(item, parent_anchor_by_key, parent_anchor_by_title)
+    prefix = issue_heading_link(issue)
+    if prefix:
+        title = f"{prefix}: {title}"
+
+    parent_reference = sub_issue_parent_reference(
+        item,
+        parent_anchor_by_key,
+        parent_anchor_by_title,
+        parent_label_by_key,
+    )
     if parent_reference:
-        title = f'{title} (sub-issue of "{parent_reference}")'
+        title = f"{title} (sub-issue of {parent_reference})"
     return title
 
 
@@ -1422,15 +1467,22 @@ def issue_heading(
     column: str,
     parent_anchor_by_key: dict[tuple[str, str, int], str] | None = None,
     parent_anchor_by_title: dict[str, str] | None = None,
+    parent_label_by_key: dict[tuple[str, str, int], str] | None = None,
 ) -> str:
     if column == ARCHIVED_SECTION_KEY:
-        return archived_issue_heading(issue, item, parent_anchor_by_key, parent_anchor_by_title)
-    return issue_base_heading(issue, item, parent_anchor_by_key, parent_anchor_by_title)
+        return archived_issue_heading(
+            issue,
+            item,
+            parent_anchor_by_key,
+            parent_anchor_by_title,
+            parent_label_by_key,
+        )
+    return issue_base_heading(issue, item, parent_anchor_by_key, parent_anchor_by_title, parent_label_by_key)
 
 
 def compute_issue_heading_anchors(
     grouped: OrderedDict[str, list[dict[str, Any]]],
-) -> tuple[dict[tuple[str, str, int], str], dict[str, str]]:
+) -> tuple[dict[tuple[str, str, int], str], dict[str, str], dict[tuple[str, str, int], str]]:
     """Precompute anchors for generated issue headings.
 
     GitHub de-duplicates heading anchors by render order. Including the top-level
@@ -1441,6 +1493,18 @@ def compute_issue_heading_anchors(
     tracker = HeadingAnchorTracker()
     anchor_by_key: dict[tuple[str, str, int], str] = {}
     anchor_by_title: dict[str, str] = {}
+    label_by_key: dict[tuple[str, str, int], str] = {}
+
+    for items in grouped.values():
+        for item in items:
+            issue = item.get("content")
+            if not isinstance(issue, dict):
+                continue
+
+            key = issue_key(issue)
+            label = issue_reference_label(issue)
+            if key and label:
+                label_by_key.setdefault(key, label)
 
     for column, items in grouped.items():
         tracker.anchor_for(heading_text(markdown_section_heading(column)))
@@ -1450,7 +1514,7 @@ def compute_issue_heading_anchors(
             if not isinstance(issue, dict):
                 continue
 
-            heading = issue_heading(issue, item, column)
+            heading = issue_heading(issue, item, column, parent_label_by_key=label_by_key)
             anchor = tracker.anchor_for(heading)
 
             key = issue_key(issue)
@@ -1460,7 +1524,7 @@ def compute_issue_heading_anchors(
             title = heading_text(issue.get("title"))
             anchor_by_title.setdefault(title, anchor)
 
-    return anchor_by_key, anchor_by_title
+    return anchor_by_key, anchor_by_title, label_by_key
 
 
 def issue_url(issue: dict[str, Any]) -> str | None:
@@ -1471,13 +1535,22 @@ def issue_url(issue: dict[str, Any]) -> str | None:
 
 def issue_repository_details(issue: dict[str, Any]) -> tuple[str, str, int] | None:
     repository = issue.get("repository") or {}
-    if not isinstance(repository, dict):
-        return None
-
-    owner_obj = repository.get("owner") or {}
-    repo_owner = login_from_obj(owner_obj)
-    repo_name = repository.get("name")
+    repo_owner = None
+    repo_name = None
     issue_number = issue.get("number")
+
+    if isinstance(repository, dict):
+        owner_obj = repository.get("owner") or {}
+        repo_owner = login_from_obj(owner_obj)
+        repo_name = repository.get("name")
+
+    if (not repo_owner or not repo_name or issue_number is None) and issue.get("url"):
+        parsed = urlparse(str(issue.get("url")))
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 4 and parts[2] in {"issues", "pull"}:
+            repo_owner = repo_owner or parts[0]
+            repo_name = repo_name or parts[1]
+            issue_number = issue_number if issue_number is not None else parts[3]
 
     if not repo_owner or not repo_name or issue_number is None:
         return None
@@ -1488,6 +1561,127 @@ def issue_repository_details(issue: dict[str, Any]) -> tuple[str, str, int] | No
         return None
 
     return str(repo_owner), str(repo_name), number
+
+
+def merge_ranges(ranges: list[tuple[int, int]], text_length: int) -> list[tuple[int, int]]:
+    """Return sorted, non-overlapping protected Markdown character ranges."""
+    normalized = sorted(
+        (max(0, start), min(text_length, end))
+        for start, end in ranges
+        if end > start
+    )
+    merged: list[tuple[int, int]] = []
+    for start, end in normalized:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def fenced_code_block_ranges(markdown: str) -> list[tuple[int, int]]:
+    """Return character ranges for fenced code blocks in Markdown."""
+    ranges: list[tuple[int, int]] = []
+    in_fence = False
+    fence_char = ""
+    fence_length = 0
+    fence_start = 0
+    offset = 0
+
+    for line in markdown.splitlines(keepends=True):
+        if not in_fence:
+            match = re.match(r" {0,3}(`{3,}|~{3,})", line)
+            if match:
+                marker = match.group(1)
+                in_fence = True
+                fence_char = marker[0]
+                fence_length = len(marker)
+                fence_start = offset
+        else:
+            match = re.match(rf" {{0,3}}({re.escape(fence_char)}{{{fence_length},}})\s*$", line)
+            if match:
+                ranges.append((fence_start, offset + len(line)))
+                in_fence = False
+
+        offset += len(line)
+
+    if in_fence:
+        ranges.append((fence_start, len(markdown)))
+
+    return ranges
+
+
+def markdown_link_protected_ranges(markdown: str) -> list[tuple[int, int]]:
+    """Return ranges where issue-reference autolinking should not be applied."""
+    ranges = fenced_code_block_ranges(markdown)
+
+    protected_patterns = [
+        r"(?s)(`+)(?:(?!\1).)*\1",  # inline code spans
+        r"!?\[[^\]\n]*\]\([^\)\n]*\)",  # inline links and images
+        r"!?\[[^\]\n]*\]\[[^\]\n]*\]",  # reference-style links and images
+        r"(?m)^ {0,3}\[[^\]\n]+\]:\s+\S.*$",  # reference-link definitions
+        r"https?://[^\s<>)\]]+",  # raw URLs
+        r"<[^>\s]+>",  # autolinks and simple HTML tags
+    ]
+    for pattern in protected_patterns:
+        for match in re.finditer(pattern, markdown):
+            ranges.append(match.span())
+
+    return merge_ranges(ranges, len(markdown))
+
+
+def replace_issue_references_in_segment(
+    segment: str,
+    repo_owner: str,
+    repo_name: str,
+    anchor_by_key: dict[tuple[str, str, int], str],
+) -> str:
+    """Replace same-repository #NNN references in an unprotected Markdown segment."""
+    reference_pattern = re.compile(r"(?<![\w/])#([1-9][0-9]*)\b")
+
+    def replacement(match: re.Match[str]) -> str:
+        number_text = match.group(1)
+        key = (repo_owner.lower(), repo_name.lower(), int(number_text))
+        anchor = anchor_by_key.get(key)
+        if not anchor:
+            return match.group(0)
+        return f"[#{number_text}](#{anchor})"
+
+    return reference_pattern.sub(replacement, segment)
+
+
+def link_issue_references(
+    markdown: str,
+    current_issue: dict[str, Any],
+    anchor_by_key: dict[tuple[str, str, int], str],
+) -> str:
+    """Link same-repository #NNN references to exported issue headings when possible."""
+    if not markdown or not anchor_by_key:
+        return markdown
+
+    details = issue_repository_details(current_issue)
+    if not details:
+        return markdown
+
+    repo_owner, repo_name, _issue_number = details
+    ranges = markdown_link_protected_ranges(markdown)
+    if not ranges:
+        return replace_issue_references_in_segment(markdown, repo_owner, repo_name, anchor_by_key)
+
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in ranges:
+        if cursor < start:
+            pieces.append(
+                replace_issue_references_in_segment(markdown[cursor:start], repo_owner, repo_name, anchor_by_key)
+            )
+        pieces.append(markdown[start:end])
+        cursor = end
+
+    if cursor < len(markdown):
+        pieces.append(replace_issue_references_in_segment(markdown[cursor:], repo_owner, repo_name, anchor_by_key))
+
+    return "".join(pieces)
 
 
 def issue_can_have_sub_issues(issue: dict[str, Any]) -> bool:
@@ -1683,7 +1877,7 @@ def build_markdown(
     comment_count = 0
     timeline_event_count = 0
     sub_issue_count = 0
-    parent_anchor_by_key, parent_anchor_by_title = compute_issue_heading_anchors(grouped)
+    parent_anchor_by_key, parent_anchor_by_title, parent_label_by_key = compute_issue_heading_anchors(grouped)
 
     for column, items in grouped.items():
         lines.append(f"# {heading_text(markdown_section_heading(column))}")
@@ -1693,14 +1887,16 @@ def build_markdown(
             issue = item["content"]
             if item.get(SUB_ISSUE_PARENT_TITLE_KEY):
                 sub_issue_count += 1
-            heading = issue_heading(issue, item, column, parent_anchor_by_key, parent_anchor_by_title)
+            heading = issue_heading(
+                issue,
+                item,
+                column,
+                parent_anchor_by_key,
+                parent_anchor_by_title,
+                parent_label_by_key,
+            )
             lines.append(f"## {heading}")
             lines.append("")
-
-            url = issue_url(issue)
-            if url:
-                lines.append(f"* **URL:** [{url}]({url})")
-                lines.append("")
 
             repository = issue.get("repository") or {}
             owner_obj = repository.get("owner") or {}
@@ -1731,7 +1927,7 @@ def build_markdown(
 
                 lines.append(timeline_entry_heading(entry, tz))
                 lines.append("")
-                lines.append(str(entry.get("body") or ""))
+                lines.append(link_issue_references(str(entry.get("body") or ""), issue, parent_anchor_by_key))
                 lines.append("")
 
     # End files with exactly one newline.
