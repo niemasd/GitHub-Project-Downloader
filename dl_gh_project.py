@@ -19,8 +19,9 @@ Notes:
         https://github.com/users/OWNER/projects/NUMBER
         https://github.com/orgs/OWNER/projects/NUMBER/views/VIEW_NUMBER
     - It exports issue opening posts, issue comments, and issue / pull-request timeline events.
+    - It exports draft project items as draft-only sections with their bodies.
     - It also exports issue sub-issues as peer Markdown sections after their parent issue.
-    - It does not export pull-request review comments or draft-project-item text.
+    - It does not export pull-request review comments.
 """
 
 from __future__ import annotations
@@ -178,6 +179,9 @@ query(
           isArchived
           createdAt
           updatedAt
+          creator {
+            login
+          }
 
           columnValue: fieldValueByName(name: $columnFieldName) {
             __typename
@@ -258,6 +262,9 @@ query(
               body
               createdAt
               updatedAt
+              creator {
+                login
+              }
             }
           }
         }
@@ -924,13 +931,18 @@ def issue_key(issue: dict[str, Any]) -> tuple[str, str, int] | None:
     repo_name = repository.get("name") if isinstance(repository, dict) else None
     issue_number = issue.get("number")
 
-    if (not repo_owner or not repo_name or not issue_number) and issue.get("url"):
-        parsed = urlparse(str(issue.get("url")))
+    html_or_api_url = issue.get("html_url") or issue.get("url")
+    if (not repo_owner or not repo_name or not issue_number) and html_or_api_url:
+        parsed = urlparse(str(html_or_api_url))
         parts = [part for part in parsed.path.split("/") if part]
         if len(parts) >= 4 and parts[2] in {"issues", "pull"}:
             repo_owner = repo_owner or parts[0]
             repo_name = repo_name or parts[1]
             issue_number = issue_number or parts[3]
+        elif len(parts) >= 5 and parts[0] == "repos" and parts[3] in {"issues", "pulls"}:
+            repo_owner = repo_owner or parts[1]
+            repo_name = repo_name or parts[2]
+            issue_number = issue_number or parts[4]
 
     if not repo_owner or not repo_name or not issue_number:
         return None
@@ -943,6 +955,21 @@ def issue_key(issue: dict[str, Any]) -> tuple[str, str, int] | None:
     return repo_owner.lower(), repo_name.lower(), number
 
 
+def is_draft_issue(issue: dict[str, Any]) -> bool:
+    return issue.get("__typename") == "DraftIssue"
+
+
+def project_item_creator_login(item: dict[str, Any]) -> str | None:
+    return login_from_obj(item.get("creator"))
+
+
+def issue_display_title(issue: dict[str, Any]) -> str:
+    title = heading_text(issue.get("title"))
+    if is_draft_issue(issue):
+        return f"{title} (Draft)"
+    return title
+
+
 def issue_key_for_item(item: dict[str, Any]) -> tuple[str, str, int] | None:
     content = item.get("content")
     if not isinstance(content, dict):
@@ -952,10 +979,10 @@ def issue_key_for_item(item: dict[str, Any]) -> tuple[str, str, int] | None:
 
 def original_post_as_entry(issue: dict[str, Any]) -> dict[str, Any]:
     """Return the Issue/PR opening body in the same shape as a Markdown timeline entry."""
-    author = issue.get("author") or {}
+    login = login_from_obj(issue.get("author")) or login_from_obj(issue.get("creator")) or "unknown"
     return {
         "kind": "comment",
-        "login": author.get("login") or "unknown",
+        "login": login,
         "created_at": issue.get("createdAt"),
         "body": issue.get("body") or "",
         "dedupe_key": f"original:{issue.get('id') or issue.get('url') or issue.get('number')}",
@@ -1038,7 +1065,26 @@ def project_card_field(event: dict[str, Any], field_name: str) -> str | None:
     return None
 
 
-def event_body_for_rest_event(event: dict[str, Any], tz: ZoneInfo) -> str:
+def markdown_issue_title_link(
+    title: Any,
+    issue: dict[str, Any] | None,
+    anchor_by_key: dict[tuple[str, str, int], str],
+) -> str:
+    """Return a Markdown link for an issue title, preferring local anchors."""
+    label = markdown_code_link_label(title)
+    if isinstance(issue, dict):
+        target = issue_reference_target(issue, anchor_by_key)
+        if target:
+            return f"[{label}]({target})"
+    return markdown_inline_code(title)
+
+
+def event_body_for_rest_event(
+    event: dict[str, Any],
+    tz: ZoneInfo,
+    anchor_by_key: dict[tuple[str, str, int], str] | None = None,
+) -> str:
+    anchor_by_key = anchor_by_key or {}
     event_type = str(event.get("event") or "event").lower()
     actor = login_from_obj(event.get("actor")) or login_from_obj(event.get("user")) or "unknown"
     date_text = human_event_date(str(event.get("created_at") or ""), tz)
@@ -1108,7 +1154,8 @@ def event_body_for_rest_event(event: dict[str, Any], tz: ZoneInfo) -> str:
         issue = source.get("issue") if isinstance(source, dict) else None
         title = nested_name(issue) if issue else None
         if title:
-            return f"{actor} cross-referenced this from {markdown_inline_code(title)} on {date_text}"
+            linked_title = markdown_issue_title_link(title, issue, anchor_by_key)
+            return f"{actor} cross-referenced this from {linked_title} on {date_text}"
         return f"{actor} cross-referenced this on {date_text}"
 
     if event_type == "review_requested":
@@ -1154,7 +1201,11 @@ def event_body_for_rest_event(event: dict[str, Any], tz: ZoneInfo) -> str:
     return f"{actor} {action} this on {date_text}"
 
 
-def rest_timeline_event_as_entry(event: dict[str, Any], tz: ZoneInfo) -> dict[str, Any]:
+def rest_timeline_event_as_entry(
+    event: dict[str, Any],
+    tz: ZoneInfo,
+    anchor_by_key: dict[tuple[str, str, int], str] | None = None,
+) -> dict[str, Any]:
     event_type = str(event.get("event") or "event").lower()
     is_comment = event_type == "commented"
     login = login_from_obj(event.get("user")) or login_from_obj(event.get("actor")) or "unknown"
@@ -1165,7 +1216,7 @@ def rest_timeline_event_as_entry(event: dict[str, Any], tz: ZoneInfo) -> dict[st
         "kind": "comment" if is_comment else "event",
         "login": login,
         "created_at": created_at,
-        "body": event.get("body") or "" if is_comment else event_body_for_rest_event(event, tz),
+        "body": event.get("body") or "" if is_comment else event_body_for_rest_event(event, tz, anchor_by_key),
         "dedupe_key": f"rest:{identifier}",
     }
 
@@ -1277,6 +1328,7 @@ def collect_issue_timeline_entries(
     issue_number: int,
     issue: dict[str, Any],
     tz: ZoneInfo,
+    anchor_by_key: dict[tuple[str, str, int], str] | None = None,
 ) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1296,7 +1348,7 @@ def collect_issue_timeline_entries(
 
     for event in iter_issue_timeline_events(client, repo_owner, repo_name, issue_number):
         if isinstance(event, dict):
-            add_entry(rest_timeline_event_as_entry(event, tz))
+            add_entry(rest_timeline_event_as_entry(event, tz, anchor_by_key))
 
     content_id = issue.get("id")
     if isinstance(content_id, str) and content_id:
@@ -1305,6 +1357,21 @@ def collect_issue_timeline_entries(
 
     entries.sort(key=lambda entry: (timeline_sort_value(entry), int(entry.get("_order", 0))))
     return entries
+
+
+def collect_draft_timeline_entries(item: dict[str, Any], draft_issue: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the exportable body entry for a Project v2 draft issue card."""
+    entry = original_post_as_entry(draft_issue)
+
+    if entry.get("login") == "unknown":
+        creator_login = project_item_creator_login(item)
+        if creator_login:
+            entry["login"] = creator_login
+
+    if not entry.get("created_at"):
+        entry["created_at"] = item.get("createdAt")
+
+    return [entry]
 
 
 def ensure_archived_section_at_end(grouped: OrderedDict[str, list[dict[str, Any]]]) -> None:
@@ -1445,7 +1512,7 @@ def issue_base_heading(
     parent_anchor_by_title: dict[str, str] | None = None,
     parent_label_by_key: dict[tuple[str, str, int], str] | None = None,
 ) -> str:
-    title = heading_text(issue.get("title"))
+    title = issue_display_title(issue)
     prefix = issue_heading_link(issue)
     if prefix:
         title = f"{prefix}: {title}"
@@ -1521,17 +1588,65 @@ def compute_issue_heading_anchors(
             if key and key not in anchor_by_key:
                 anchor_by_key[key] = anchor
 
-            title = heading_text(issue.get("title"))
-            anchor_by_title.setdefault(title, anchor)
+            raw_title = heading_text(issue.get("title"))
+            anchor_by_title.setdefault(raw_title, anchor)
+            anchor_by_title.setdefault(issue_display_title(issue), anchor)
 
     return anchor_by_key, anchor_by_title, label_by_key
 
 
 def issue_url(issue: dict[str, Any]) -> str | None:
+    html_url = issue.get("html_url")
+    if html_url:
+        return str(html_url)
+
     url = issue.get("url")
     if not url:
         return None
+
+    parsed = urlparse(str(url))
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 5 and parts[0] == "repos" and parts[3] in {"issues", "pulls"}:
+        try:
+            number = int(parts[4])
+        except ValueError:
+            return str(url)
+        path_kind = "pull" if parts[3] == "pulls" else "issues"
+        owner_q = quote(parts[1], safe="")
+        repo_q = quote(parts[2], safe="")
+        return f"https://github.com/{owner_q}/{repo_q}/{path_kind}/{number}"
+
     return str(url)
+
+
+def github_issue_url(repo_owner: str, repo_name: str, issue_number: int | str) -> str:
+    """Return a stable GitHub web URL for an issue-style reference."""
+    owner_q = quote(str(repo_owner), safe="")
+    repo_q = quote(str(repo_name), safe="")
+    return f"https://github.com/{owner_q}/{repo_q}/issues/{int(issue_number)}"
+
+
+def issue_reference_target(
+    issue: dict[str, Any],
+    anchor_by_key: dict[tuple[str, str, int], str],
+) -> str | None:
+    """Return a local heading target for exported issues, otherwise the GitHub URL."""
+    key = issue_key(issue)
+    if key:
+        anchor = anchor_by_key.get(key)
+        if anchor:
+            return f"#{anchor}"
+
+    url = issue_url(issue)
+    if url:
+        return url
+
+    details = issue_repository_details(issue)
+    if details:
+        repo_owner, repo_name, issue_number = details
+        return github_issue_url(repo_owner, repo_name, issue_number)
+
+    return None
 
 def issue_repository_details(issue: dict[str, Any]) -> tuple[str, str, int] | None:
     repository = issue.get("repository") or {}
@@ -1544,13 +1659,18 @@ def issue_repository_details(issue: dict[str, Any]) -> tuple[str, str, int] | No
         repo_owner = login_from_obj(owner_obj)
         repo_name = repository.get("name")
 
-    if (not repo_owner or not repo_name or issue_number is None) and issue.get("url"):
-        parsed = urlparse(str(issue.get("url")))
+    html_or_api_url = issue.get("html_url") or issue.get("url")
+    if (not repo_owner or not repo_name or issue_number is None) and html_or_api_url:
+        parsed = urlparse(str(html_or_api_url))
         parts = [part for part in parsed.path.split("/") if part]
         if len(parts) >= 4 and parts[2] in {"issues", "pull"}:
             repo_owner = repo_owner or parts[0]
             repo_name = repo_name or parts[1]
             issue_number = issue_number if issue_number is not None else parts[3]
+        elif len(parts) >= 5 and parts[0] == "repos" and parts[3] in {"issues", "pulls"}:
+            repo_owner = repo_owner or parts[1]
+            repo_name = repo_name or parts[2]
+            issue_number = issue_number if issue_number is not None else parts[4]
 
     if not repo_owner or not repo_name or issue_number is None:
         return None
@@ -1632,20 +1752,34 @@ def markdown_link_protected_ranges(markdown: str) -> list[tuple[int, int]]:
 
 def replace_issue_references_in_segment(
     segment: str,
-    repo_owner: str,
-    repo_name: str,
+    repo_owner: str | None,
+    repo_name: str | None,
     anchor_by_key: dict[tuple[str, str, int], str],
 ) -> str:
-    """Replace same-repository #NNN references in an unprotected Markdown segment."""
-    reference_pattern = re.compile(r"(?<![\w/])#([1-9][0-9]*)\b")
+    """Replace GitHub issue references in an unprotected Markdown segment.
+
+    Prefer local anchors for issues exported into this Markdown file. If a
+    referenced issue is not exported, link to the issue's GitHub URL instead of
+    creating or leaving a dead local reference.
+    """
+    reference_pattern = re.compile(
+        r"(?<![\w./-])"
+        r"(?:(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+))?"
+        r"#(?P<number>[1-9][0-9]*)\b"
+    )
 
     def replacement(match: re.Match[str]) -> str:
-        number_text = match.group(1)
-        key = (repo_owner.lower(), repo_name.lower(), int(number_text))
-        anchor = anchor_by_key.get(key)
-        if not anchor:
+        number_text = match.group("number")
+        owner = match.group("owner") or repo_owner
+        repo = match.group("repo") or repo_name
+        if not owner or not repo:
             return match.group(0)
-        return f"[#{number_text}](#{anchor})"
+
+        number = int(number_text)
+        key = (owner.lower(), repo.lower(), number)
+        anchor = anchor_by_key.get(key)
+        target = f"#{anchor}" if anchor else github_issue_url(owner, repo, number)
+        return f"[{markdown_link_text(match.group(0))}]({target})"
 
     return reference_pattern.sub(replacement, segment)
 
@@ -1655,15 +1789,16 @@ def link_issue_references(
     current_issue: dict[str, Any],
     anchor_by_key: dict[tuple[str, str, int], str],
 ) -> str:
-    """Link same-repository #NNN references to exported issue headings when possible."""
-    if not markdown or not anchor_by_key:
+    """Link issue references to exported headings or GitHub as a safe fallback."""
+    if not markdown:
         return markdown
 
+    repo_owner = None
+    repo_name = None
     details = issue_repository_details(current_issue)
-    if not details:
-        return markdown
+    if details:
+        repo_owner, repo_name, _issue_number = details
 
-    repo_owner, repo_name, _issue_number = details
     ranges = markdown_link_protected_ranges(markdown)
     if not ranges:
         return replace_issue_references_in_segment(markdown, repo_owner, repo_name, anchor_by_key)
@@ -1822,7 +1957,9 @@ def group_project_items(
     stats = {
         "items_seen": 0,
         "issue_or_pr_items": 0,
+        "draft_items_exported": 0,
         "archived_issue_or_pr_items": 0,
+        "archived_draft_items": 0,
         "draft_items_skipped": 0,
         "redacted_items_skipped": 0,
         "other_items_skipped": 0,
@@ -1833,20 +1970,25 @@ def group_project_items(
         content = item.get("content")
         content_type = content.get("__typename") if isinstance(content, dict) else None
 
-        if content_type not in {"Issue", "PullRequest"}:
-            if content_type == "DraftIssue":
-                stats["draft_items_skipped"] += 1
-            elif content_type is None or item.get("type") == "REDACTED":
+        if content_type not in {"Issue", "PullRequest", "DraftIssue"}:
+            if content_type is None or item.get("type") == "REDACTED":
                 stats["redacted_items_skipped"] += 1
             else:
                 stats["other_items_skipped"] += 1
             return
 
-        stats["issue_or_pr_items"] += 1
+        if content_type == "DraftIssue":
+            stats["draft_items_exported"] += 1
+        else:
+            stats["issue_or_pr_items"] += 1
+
         column = column_name_for_item(item, column_field_name)
 
         if archived:
-            stats["archived_issue_or_pr_items"] += 1
+            if content_type == "DraftIssue":
+                stats["archived_draft_items"] += 1
+            else:
+                stats["archived_issue_or_pr_items"] += 1
             archived_item = dict(item)
             archived_item[ARCHIVED_FROM_COLUMN_KEY] = column
             grouped.setdefault(ARCHIVED_SECTION_KEY, []).append(archived_item)
@@ -1898,25 +2040,25 @@ def build_markdown(
             lines.append(f"## {heading}")
             lines.append("")
 
-            repository = issue.get("repository") or {}
-            owner_obj = repository.get("owner") or {}
-            repo_owner = owner_obj.get("login")
-            repo_name = repository.get("name")
-            issue_number = issue.get("number")
+            if is_draft_issue(issue):
+                entries = collect_draft_timeline_entries(item, issue)
+            else:
+                details = issue_repository_details(issue)
+                if not details:
+                    lines.append("<!-- Skipped timeline: missing repository or issue number in API response. -->")
+                    lines.append("")
+                    continue
 
-            if not repo_owner or not repo_name or not issue_number:
-                lines.append("<!-- Skipped timeline: missing repository or issue number in API response. -->")
-                lines.append("")
-                continue
-
-            entries = collect_issue_timeline_entries(
-                client,
-                str(repo_owner),
-                str(repo_name),
-                int(issue_number),
-                issue,
-                tz,
-            )
+                repo_owner, repo_name, issue_number = details
+                entries = collect_issue_timeline_entries(
+                    client,
+                    str(repo_owner),
+                    str(repo_name),
+                    int(issue_number),
+                    issue,
+                    tz,
+                    parent_anchor_by_key,
+                )
 
             for entry in entries:
                 entry_count += 1
@@ -2015,25 +2157,25 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
         f"{stats['entries_exported']} Markdown entries "
         f"({stats['comments_exported']} comments/original posts and "
         f"{stats['timeline_events_exported']} timeline events) from "
-        f"{stats['issue_or_pr_items']} issue/PR cards "
+        f"{stats['issue_or_pr_items']} issue/PR cards, "
+        f"{stats['draft_items_exported']} draft cards, "
         f"plus {stats['sub_issue_items_exported']} sub-issues "
-        f"({stats['archived_issue_or_pr_items']} archived) "
+        f"({stats['archived_issue_or_pr_items']} archived issue/PR cards and "
+        f"{stats['archived_draft_items']} archived draft cards) "
         f"across {stats['columns_written']} columns "
         f"to {args.output}",
         file=sys.stderr,
     )
 
     skipped = (
-        int(stats["draft_items_skipped"])
-        + int(stats["redacted_items_skipped"])
+        int(stats["redacted_items_skipped"])
         + int(stats["other_items_skipped"])
     )
     if skipped:
         print(
             "Skipped "
-            f"{stats['draft_items_skipped']} draft, "
-            f"{stats['redacted_items_skipped']} redacted, and "
-            f"{stats['other_items_skipped']} other non-issue/non-PR project items.",
+            f"{stats['redacted_items_skipped']} redacted and "
+            f"{stats['other_items_skipped']} other non-issue/non-PR/non-draft project items.",
             file=sys.stderr,
         )
 
