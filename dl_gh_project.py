@@ -42,6 +42,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -64,7 +65,7 @@ DEFAULT_WORKERS = cpu_count()
 MAX_WORKERS = 16
 CONCURRENT_REQUEST_SPACING_SECONDS = 0.10
 MAX_API_RETRIES = 5
-USER_AGENT = "dl-gh-project-v2/1.8"
+USER_AGENT = "dl-gh-project-v2/1.9"
 ARCHIVED_COLUMN_NAME = "Archived"
 ARCHIVED_SECTION_KEY = "__dl_gh_project_archived_items__"
 ARCHIVED_FROM_COLUMN_KEY = "_dl_gh_project_archived_from_column"
@@ -1741,36 +1742,77 @@ def markdown_heading_plain_text(value: str) -> str:
     """Return approximate rendered text for a Markdown heading.
 
     This is used only to build GitHub-style heading anchors. It strips common
-    inline Markdown forms whose visible text is what GitHub uses for the slug.
+    inline Markdown forms whose visible text is what GitHub uses for the slug,
+    then decodes character references as the Markdown renderer would.
     """
     text = str(value or "")
     text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"`([^`]*)`", r"\1", text)
     text = re.sub(r"<[^>]+>", "", text)
-    return text
+    return html.unescape(text)
+
+
+def github_heading_slug_character_is_kept(character: str) -> bool:
+    """Return whether GitHub keeps ``character`` in a heading slug.
+
+    GitHub retains letters, combining marks, decimal / letter numbers,
+    connector punctuation, the ordinary ASCII hyphen, and ordinary spaces.
+    Most other punctuation, symbols, controls, and separators are removed.
+    A small set of alphabetic symbols is retained by GitHub; NFKC-to-one-letter
+    symbols cover the common enclosed-letter cases without a large lookup table.
+    """
+
+    if character in {" ", "-"}:
+        return True
+
+    category = unicodedata.category(character)
+    if category[0] in {"L", "M"} or category in {"Nd", "Nl", "Pc"}:
+        return True
+
+    if category[0] == "S":
+        normalized = unicodedata.normalize("NFKC", character)
+        return len(normalized) == 1 and normalized.isalpha()
+
+    return False
 
 
 def github_heading_slug(value: str) -> str:
-    """Return a GitHub-style slug for a Markdown heading."""
-    text = markdown_heading_plain_text(value).strip().lower()
-    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
-    text = re.sub(r"\s+", "-", text)
-    return text.strip("-")
+    """Return a GitHub-style slug for a Markdown heading.
+
+    Each retained ordinary space becomes one hyphen. Spaces are deliberately
+    not collapsed: punctuation between two spaces is removed first, so a
+    heading such as ``A – B`` becomes ``a--b``.
+    """
+
+    text = markdown_heading_plain_text(value).lower()
+    retained = "".join(
+        character
+        for character in text
+        if github_heading_slug_character_is_kept(character)
+    )
+    return retained.replace(" ", "-")
 
 
 class HeadingAnchorTracker:
-    """Track duplicate GitHub-style heading anchors in render order."""
+    """Track unique GitHub-style heading anchors in render order."""
 
     def __init__(self) -> None:
-        self._seen: dict[str, int] = {}
+        self._occurrences: dict[str, int] = {}
 
     def anchor_for(self, heading: str) -> str:
         slug = github_heading_slug(heading)
-        count = self._seen.get(slug, 0)
-        self._seen[slug] = count + 1
-        if count:
-            return f"{slug}-{count}"
+        original_slug = slug
+
+        # Collision checks must include already-generated suffixed anchors. For
+        # example, headings ``echo``, ``echo``, and ``echo 1`` become
+        # ``echo``, ``echo-1``, and ``echo-1-1`` rather than duplicating
+        # ``echo-1``.
+        while slug in self._occurrences:
+            self._occurrences[original_slug] += 1
+            slug = f"{original_slug}-{self._occurrences[original_slug]}"
+
+        self._occurrences[slug] = 0
         return slug
 
 
